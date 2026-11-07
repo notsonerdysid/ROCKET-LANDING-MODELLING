@@ -1,0 +1,28 @@
+#no dragg, cont mass, var accn
+import math
+
+def gh(R,h,g0):
+    temp = g0*(R/(R+h))**2
+    return temp
+
+def update_velocity(v,gh,dt):
+    vn = v + gh*dt
+    return vn
+
+def update_altitude(h,vn,dt):
+    hn = h - vn*dt
+    return hn
+
+h = 70000
+g0 = 9.81
+v = 1666.67
+R = 6371000
+dt = 0
+
+while h>0:
+    gh1 = gh(R,h,g0)
+    v = update_velocity(v,gh1,dt)
+    h = update_altitude(h,v,dt)
+    dt = dt + 0.1
+
+print(v)
