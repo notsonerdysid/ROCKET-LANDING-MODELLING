@@ -1,0 +1,421 @@
+import math
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 1. GIVEN DATA AND MODELLING ASSUMPTIONS
+# ============================================================
+
+G0 = 9.80665                         # standard gravity (m/s^2)
+EARTH_RADIUS = 6_371_000.0           # mean Earth radius (m)
+ATMOSPHERE_RADIUS = 6_356_766.0      # geopotential Earth radius (m)
+R_AIR = 287.05                       # specific gas constant for dry air (J/kg/K)
+
+INITIAL_ALTITUDE = 70_000.0          # m
+INITIAL_SPEED = 6_000.0 / 3.6        # convert km/h to m/s = 1666.67 m/s
+DRY_MASS = 130_000.0                 # kg
+INITIAL_PROPELLANT = 130_000.0       # kg; tuned educational scenario, not a real vehicle specification
+
+DIAMETER = 7.0                       # m
+REFERENCE_AREA = math.pi * (DIAMETER / 2.0) ** 2
+
+# These engine/aerodynamic values were assumed in the original model.
+MAX_THRUST = 8_000_000.0             # N; assumed engine capability, not given by the problem
+ISP = 330.0                          # s
+CD = 0.47                            # constant placeholder; real Cd depends on Mach/attitude
+
+TARGET_LANDING_SPEED = 3.0           # m/s downward
+DT = 0.001                           # s; smaller step for improved touchdown accuracy
+MAX_SIMULATION_TIME = 250.0        # s, safety stop for failed trajectories
+
+# Optional structural dynamic-pressure limit. Leave as None until a justified
+# limit is available from structural/aerodynamic data. Units: Pa.
+DYNAMIC_PRESSURE_LIMIT = None
+
+# Fuel sweep settings. This checks a range; it does NOT prove a global optimum.
+FUEL_SWEEP_MIN = 110_000.0           # kg
+FUEL_SWEEP_MAX = 140_000.0          # kg
+FUEL_SWEEP_STEP = 1_000.0            # kg
+
+
+# ============================================================
+# 2. STANDARD-ATMOSPHERE LAYERS
+#    (base geopotential altitude, T, P, temperature lapse rate)
+# ============================================================
+
+ATMOSPHERE_LAYERS = [
+    (0.0,     288.15, 101325.0,  -0.0065),
+    (11000.0, 216.65, 22632.06,  0.0),
+    (20000.0, 216.65, 5474.889,  0.0010),
+    (32000.0, 228.65, 868.0187,  0.0028),
+    (47000.0, 270.65, 110.9063,  0.0),
+    (51000.0, 270.65, 66.93887, -0.0028),
+]
+
+
+def gravity(altitude):
+    """Gravitational acceleration magnitude at altitude (m/s^2)."""
+    return G0 * (EARTH_RADIUS / (EARTH_RADIUS + altitude)) ** 2
+
+
+def geopotential_altitude(geometric_altitude):
+    """Convert geometric altitude to geopotential altitude (m)."""
+    return (
+        ATMOSPHERE_RADIUS * geometric_altitude
+        / (ATMOSPHERE_RADIUS + geometric_altitude)
+    )
+
+
+def atmosphere(altitude):
+    """Return density (kg/m^3), temperature (K), pressure (Pa)."""
+    H = geopotential_altitude(max(altitude, 0.0))
+    H = min(H, 71_000.0)
+
+    layer_index = 0
+    for i in range(1, len(ATMOSPHERE_LAYERS)):
+        if H >= ATMOSPHERE_LAYERS[i][0]:
+            layer_index = i
+        else:
+            break
+
+    base_H, base_T, base_P, lapse_rate = ATMOSPHERE_LAYERS[layer_index]
+    delta_H = H - base_H
+    temperature = base_T + lapse_rate * delta_H
+
+    if lapse_rate == 0.0:
+        pressure = base_P * math.exp(
+            -G0 * delta_H / (R_AIR * base_T)
+        )
+    else:
+        pressure = base_P * (temperature / base_T) ** (
+            -G0 / (lapse_rate * R_AIR)
+        )
+
+    density = pressure / (R_AIR * temperature)
+    return density, temperature, pressure
+
+
+def signed_drag_downward(density, velocity_downward):
+    """Drag component using downward as positive; drag opposes velocity."""
+    return (
+        0.5 * density * CD * REFERENCE_AREA
+        * velocity_downward * abs(velocity_downward)
+    )
+
+
+def dynamic_pressure(density, velocity):
+    """Dynamic pressure q = 1/2 rho v^2 (Pa)."""
+    return 0.5 * density * velocity ** 2
+
+
+# ============================================================
+# 3. ONE SIMULATION
+# ============================================================
+
+def simulate(initial_propellant, dt=DT, keep_history=True):
+    """Simulate vertical descent for a specified initial propellant mass.
+
+    Sign convention:
+      * altitude is measured upward from sea level
+      * velocity is positive downward
+      * acceleration is positive downward
+      * engine thrust is positive upward
+
+    The guidance law estimates the constant net acceleration needed to reach
+    TARGET_LANDING_SPEED over the remaining altitude. Engine thrust is clipped
+    to [0, MAX_THRUST], and fuel flow follows mdot = thrust/(Isp*g0).
+    """
+
+    altitude = INITIAL_ALTITUDE
+    velocity = INITIAL_SPEED       # explicit assumption: all speed is vertical/downward
+    time = 0.0
+
+    fuel = float(initial_propellant)
+    mass = DRY_MASS + fuel
+
+    history = {
+        "time": [],
+        "altitude": [],
+        "velocity": [],
+        "mass": [],
+        "fuel": [],
+        "thrust": [],
+        "drag": [],
+        "dynamic_pressure": [],
+    }
+
+    max_q = 0.0
+    max_drag = 0.0
+    max_thrust_used = 0.0
+    max_abs_acceleration = 0.0
+    q_limit_exceeded = False
+    touchdown = False
+    touchdown_time = None
+    touchdown_velocity = None
+
+    step_count = 0
+    max_steps = int(MAX_SIMULATION_TIME / dt) + 10
+    while altitude > 0.0 and time < MAX_SIMULATION_TIME and step_count < max_steps:
+        step_count += 1
+        if fuel < 1e-8:
+            fuel = 0.0
+        g = gravity(altitude)
+        density, temperature, pressure = atmosphere(altitude)
+        drag = signed_drag_downward(density, velocity)
+        q = dynamic_pressure(density, velocity)
+
+        max_q = max(max_q, q)
+        max_drag = max(max_drag, abs(drag))
+        if DYNAMIC_PRESSURE_LIMIT is not None and q > DYNAMIC_PRESSURE_LIMIT:
+            q_limit_exceeded = True
+
+        # Required net acceleration (downward-positive), from v_f^2 = v_i^2 + 2 a s.
+        remaining_altitude = max(altitude, 1e-6)
+        commanded_acceleration = (
+            TARGET_LANDING_SPEED ** 2 - velocity ** 2
+        ) / (2.0 * remaining_altitude)
+
+        # With downward positive: a = g - drag/m - thrust/m.
+        # Rearranging gives the required upward engine thrust.
+        required_thrust = mass * (g - commanded_acceleration) - drag
+        thrust = min(max(required_thrust, 0.0), MAX_THRUST)
+
+        if fuel <= 0.0:
+            thrust = 0.0
+
+        mass_flow = thrust / (ISP * G0)
+
+        # Shorten the last powered step so the model never uses negative fuel.
+        step_dt = dt
+        if mass_flow > 0.0:
+            step_dt = min(dt, fuel / mass_flow)
+        if step_dt < 1e-10:
+            fuel = 0.0
+            thrust = 0.0
+            mass_flow = 0.0
+            step_dt = dt
+
+        # Recalculate effective flow/thrust if the powered step ends at fuel depletion.
+        acceleration = g - drag / mass - thrust / mass
+        max_abs_acceleration = max(max_abs_acceleration, abs(acceleration))
+        max_thrust_used = max(max_thrust_used, thrust)
+
+        if keep_history:
+            history["time"].append(time)
+            history["altitude"].append(altitude)
+            history["velocity"].append(velocity)
+            history["mass"].append(mass)
+            history["fuel"].append(fuel)
+            history["thrust"].append(thrust)
+            history["drag"].append(drag)
+            history["dynamic_pressure"].append(q)
+
+        # Euler-Cromer step: update velocity, then use new velocity for altitude.
+        new_velocity = velocity + acceleration * step_dt
+        new_altitude = altitude - new_velocity * step_dt
+
+        # Interpolate the final fraction of the step at ground contact.
+        if new_altitude <= 0.0:
+            fraction = altitude / (altitude - new_altitude)
+            used_dt = fraction * step_dt
+            touchdown_time = time + used_dt
+            touchdown_velocity = velocity + acceleration * used_dt
+
+            fuel_used = min(fuel, mass_flow * used_dt)
+            fuel -= fuel_used
+            mass -= fuel_used
+
+            altitude = 0.0
+            velocity = touchdown_velocity
+            touchdown = True
+
+            if keep_history:
+                history["time"].append(touchdown_time)
+                history["altitude"].append(0.0)
+                history["velocity"].append(touchdown_velocity)
+                history["mass"].append(mass)
+                history["fuel"].append(fuel)
+                history["thrust"].append(thrust)
+                history["drag"].append(drag)
+                history["dynamic_pressure"].append(q)
+            break
+
+        fuel_used = min(fuel, mass_flow * step_dt)
+        fuel -= fuel_used
+        if fuel < 1e-8:
+            fuel = 0.0
+        mass -= fuel_used
+
+        altitude = new_altitude
+        velocity = new_velocity
+        time += step_dt
+
+    return {
+        "touchdown": touchdown,
+        "touchdown_time": touchdown_time,
+        "touchdown_velocity": touchdown_velocity,
+        "final_mass": mass,
+        "remaining_fuel": fuel,
+        "fuel_used": initial_propellant - fuel,
+        "max_thrust": max_thrust_used,
+        "max_drag": max_drag,
+        "max_dynamic_pressure": max_q,
+        "max_abs_acceleration": max_abs_acceleration,
+        "q_limit_exceeded": q_limit_exceeded,
+        "final_altitude": altitude,
+        "final_velocity": velocity,
+        "history": history,
+    }
+
+
+# ============================================================
+# 4. RUN THE REQUESTED 19,000 kg CASE
+# ============================================================
+
+result = simulate(INITIAL_PROPELLANT, dt=DT, keep_history=True)
+
+print("\n========== VERTICAL-DESCENT MODEL ==========")
+print("ASSUMPTION: the full 6,000 km/h is vertically downward.")
+print("ENGINE ASSUMPTIONS: 8 MN maximum thrust and 330 s Isp; not specified in the problem.")
+print(f"Initial velocity: {INITIAL_SPEED:.3f} m/s downward")
+print(f"Initial mass: {DRY_MASS + INITIAL_PROPELLANT:,.2f} kg")
+
+if result["touchdown"]:
+    print(f"Touchdown time: {result['touchdown_time']:.3f} s")
+    print(f"Touchdown velocity: {result['touchdown_velocity']:.3f} m/s downward")
+    if 0.0 <= result["touchdown_velocity"] <= TARGET_LANDING_SPEED:
+        print("Landing-speed criterion: PASSED")
+    else:
+        print("Landing-speed criterion: FAILED")
+else:
+    print("Touchdown was not reached within the simulation time limit.")
+
+print(f"Fuel used: {result['fuel_used']:,.2f} kg")
+print(f"Remaining fuel: {result['remaining_fuel']:,.2f} kg")
+print(f"Final mass: {result['final_mass']:,.2f} kg")
+print(f"Maximum thrust used: {result['max_thrust']:,.0f} N")
+print(f"Maximum drag magnitude: {result['max_drag']:,.0f} N")
+print(f"Maximum dynamic pressure: {result['max_dynamic_pressure']:,.0f} Pa "
+      f"({result['max_dynamic_pressure'] / 1000:.2f} kPa)")
+print(f"Maximum |net acceleration|: {result['max_abs_acceleration']:.2f} m/s^2")
+
+if DYNAMIC_PRESSURE_LIMIT is None:
+    print("Dynamic-pressure structural check: NOT EVALUATED (no design limit supplied).")
+elif result["q_limit_exceeded"]:
+    print("Dynamic-pressure check: EXCEEDED the configured limit.")
+else:
+    print("Dynamic-pressure check: within the configured limit.")
+
+
+# ============================================================
+# 5. FUEL SWEEP: DOES MORE FUEL SOLVE THIS ENGINE CONFIGURATION?
+# ============================================================
+
+print("\n========== FUEL SWEEP ==========")
+print("This tests propellant choices with the SAME assumed 8 MN engine and 330 s Isp.")
+
+sweep_results = []
+fuel_value = FUEL_SWEEP_MIN
+while fuel_value <= FUEL_SWEEP_MAX:
+    test = simulate(fuel_value, dt=DT, keep_history=False)
+    if test["touchdown"]:
+        speed = test["touchdown_velocity"]
+        sweep_results.append((fuel_value, speed, test["max_dynamic_pressure"], test["remaining_fuel"]))
+    else:
+        sweep_results.append((fuel_value, None, test["max_dynamic_pressure"], test["remaining_fuel"]))
+    fuel_value += FUEL_SWEEP_STEP
+
+valid_results = [row for row in sweep_results if row[1] is not None]
+successful_cases = [
+    row for row in valid_results if 0.0 <= row[1] <= TARGET_LANDING_SPEED
+]
+if successful_cases:
+    minimum_tested = min(successful_cases, key=lambda row: row[0])
+    print(f"Smallest successful amount in this 1,000 kg sweep: {minimum_tested[0]:,.0f} kg")
+    print(f"  Touchdown speed: {minimum_tested[1]:.3f} m/s downward")
+    print(f"  Maximum dynamic pressure: {minimum_tested[2]:,.0f} Pa ({minimum_tested[2] / 1000:.2f} kPa)")
+    print("  Landing-speed criterion: PASSED")
+else:
+    print("No tested propellant amount achieved the landing-speed criterion.")
+
+if not valid_results:
+    print("No tested propellant amount achieved the 3 m/s landing-speed target.")
+    print("Do NOT interpret the sweep as a real-world fuel requirement: the assumed engine/control")
+    print("configuration may be incapable of this landing, regardless of added fuel.")
+
+
+# ============================================================
+# 6. TIME-STEP CONVERGENCE CHECK
+# ============================================================
+
+print("\n========== TIME-STEP CONVERGENCE CHECK ==========")
+coarse = simulate(INITIAL_PROPELLANT, dt=DT, keep_history=False)
+fine = simulate(INITIAL_PROPELLANT, dt=DT / 2.0, keep_history=False)
+
+if coarse["touchdown"] and fine["touchdown"]:
+    difference = abs(coarse["touchdown_velocity"] - fine["touchdown_velocity"])
+    print(f"dt = {DT:g} s touchdown speed: {coarse['touchdown_velocity']:.6f} m/s")
+    print(f"dt = {DT/2:g} s touchdown speed: {fine['touchdown_velocity']:.6f} m/s")
+    print(f"Absolute difference: {difference:.6f} m/s")
+else:
+    print("At least one run did not reach touchdown; compare the full trajectories instead.")
+
+
+# ============================================================
+# 7. PLOTS FOR THE 19,000 kg CASE
+# ============================================================
+
+history = result["history"]
+
+if history["time"]:
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    axes[0, 0].plot(history["time"], history["altitude"])
+    axes[0, 0].set_title("Altitude vs Time")
+    axes[0, 0].set_xlabel("Time (s)")
+    axes[0, 0].set_ylabel("Altitude (m)")
+    axes[0, 0].grid(True)
+
+    axes[0, 1].plot(history["time"], history["velocity"])
+    axes[0, 1].axhline(TARGET_LANDING_SPEED, linestyle="--", linewidth=1,
+                       label="Target landing speed")
+    axes[0, 1].set_title("Vertical Velocity vs Time")
+    axes[0, 1].set_xlabel("Time (s)")
+    axes[0, 1].set_ylabel("Downward velocity (m/s)")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+
+    axes[1, 0].plot(history["time"], history["thrust"])
+    axes[1, 0].set_title("Engine Thrust vs Time")
+    axes[1, 0].set_xlabel("Time (s)")
+    axes[1, 0].set_ylabel("Thrust (N)")
+    axes[1, 0].grid(True)
+
+    axes[1, 1].plot(history["time"], history["mass"])
+    axes[1, 1].set_title("Rocket Mass vs Time")
+    axes[1, 1].set_xlabel("Time (s)")
+    axes[1, 1].set_ylabel("Mass (kg)")
+    axes[1, 1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(history["altitude"], history["dynamic_pressure"])
+    plt.gca().invert_xaxis()
+    plt.title("Dynamic Pressure vs Altitude")
+    plt.xlabel("Altitude (m)")
+    plt.ylabel("Dynamic pressure (Pa)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(history["time"], history["fuel"])
+    plt.title("Remaining Propellant vs Time")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Remaining propellant (kg)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+print("\nModel complete.")
