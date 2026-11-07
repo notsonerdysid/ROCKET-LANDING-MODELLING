@@ -1,0 +1,115 @@
+#adding dragg and dragg coeff
+import math
+
+def gh(Radius,h,g0):
+    temp = g0*(Radius/(Radius+h))**2
+    return temp
+
+def update_velocity(v,gh,dt,drag_force, mass):
+    accn = gh - drag_force/mass
+    vn = v + accn*dt
+    return vn
+
+def update_altitude(h,vn,dt):
+    hn = h - vn*dt
+    return hn
+
+def density(gh, h, R):
+    # Layer 6: Mesosphere (51,000 m to 71,000 m)
+    if h >= 51000:
+        base_density = 0.00086
+        base_temp = 270.65
+        Lp = -0.0028  # negative because temperature drops going up
+        base_height = 51000
+        
+        temp_ratio = (base_temp + Lp * (h - base_height)) / base_temp
+        exponent = -(gh / (R * Lp) + 1.0)
+        return base_density * math.pow(temp_ratio, exponent)
+
+    # Layer 5: Stratopause (47,000 m to 51,000 m - Isothermal)
+    elif h >= 47000:
+        base_density = 0.00143
+        base_temp = 270.65
+        base_height = 47000
+        return base_density * math.exp(-gh * (h - base_height) / (R * base_temp))
+
+    # Layer 4: Stratosphere 2 (32,000 m to 47,000 m)
+    elif h >= 32000:
+        base_density = 0.01322
+        base_temp = 228.65
+        Lp = 0.0028
+        base_height = 32000
+        
+        temp_ratio = (base_temp + Lp * (h - base_height)) / base_temp
+        exponent = -(gh / (R * Lp) + 1.0)
+        return base_density * math.pow(temp_ratio, exponent)
+
+    # Layer 3: Stratosphere 1 (20,000 m to 32,000 m)
+    elif h >= 20000:
+        base_density = 0.08803
+        base_temp = 216.65
+        Lp = 0.0010
+        base_height = 20000
+        
+        temp_ratio = (base_temp + Lp * (h - base_height)) / base_temp
+        exponent = -(gh / (R * Lp) + 1.0)
+        return base_density * math.pow(temp_ratio, exponent)
+
+    # Layer 2: Tropopause (11,000 m to 20,000 m - Isothermal)
+    elif h >= 11000:
+        base_density = 0.36391
+        base_temp = 216.65
+        base_height = 11000
+        return base_density * math.exp(-gh * (h - base_height) / (R * base_temp))
+
+    # Layer 1: Troposphere (0 m to 11,000 m)
+    else:
+        base_density = 1.2250
+        base_temp = 288.15
+        Lp = -0.0065
+        base_height = 0
+        
+        temp_ratio = (base_temp + Lp * (h - base_height)) / base_temp
+        exponent = -(gh / (R * Lp) + 1.0)
+        return base_density * math.pow(temp_ratio, exponent)
+
+def drag_forc(air_density,Cd,A,v):
+    return 0.5*air_density*Cd*A*v*v
+
+h = 70000
+g0 = 9.81
+v = 1666.67
+Radius = 6371000
+R = 287.05
+dt = 0.1
+t = 0
+Cd = 0.47
+A = 38.5
+mass = 130000
+max_drag = 0
+max_h_at_maxdrag = 0
+max_q = 0
+max_h_at_maxq = 0
+
+while h>0:
+    gh1 = gh(Radius,h,g0)
+    air_density = density(gh1,h,R)
+    drag_force = drag_forc(air_density, Cd, A, v)
+    if max_drag < drag_force:
+        max_drag = drag_force
+        max_h_at_maxdrag = h
+
+    q = 0.5 * air_density * v**2
+    if q > max_q:
+        max_q = q
+        max_h_at_maxq = h
+    
+    v = update_velocity(v,gh1,dt,drag_force,mass)
+    h = update_altitude(h,v,dt)
+    t +=dt
+
+print(drag_force)
+print(max_drag)
+print(max_q)
+print(max_h_at_maxq)
+print(max_h_at_maxdrag)
